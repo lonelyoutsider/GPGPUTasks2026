@@ -79,7 +79,10 @@ the original numeric CLI argument. Environment options:
 - `TASK05_SIZE`: 1..100000000, default 100000000.
 - `TASK05_PATTERN`: random (default), full-u32, duplicates, equal, descending.
 - `TASK05_SCAN`: hierarchical (default), baseline.
+- `TASK05_LOCAL`: packed (default), baseline.
 - `TASK05_SCAN_TEST=1`: run direct histogram scan tests instead of sorting.
+- `TASK05_LOCAL_TEST=1`: compare every local rank and histogram count against
+  CPU expectations for both counting kernels, four patterns, all eight digits.
 
 PowerShell (set dependency DLL search paths as needed):
 
@@ -88,11 +91,60 @@ PowerShell (set dependency DLL search paths as needed):
 ./scripts/windows/test_task05.ps1 -Sizes 10,256,257,600,65537 `
     -Patterns full-u32,duplicates,equal,descending
 ./scripts/windows/test_task05.ps1 -Sizes 100000000 -Patterns full-u32
+./scripts/windows/test_task05.ps1 -Scans hierarchical -LocalCounters baseline,packed `
+    -OutputDirectory ./build/task05-local-comparison
 $env:TASK05_SCAN_TEST = '1'
 ./build/Release/main_radix_sort.exe 0
 Remove-Item Env:TASK05_SCAN_TEST
+$env:TASK05_LOCAL_TEST = '1'
+./build/Release/main_radix_sort.exe 0
+Remove-Item Env:TASK05_LOCAL_TEST
 ```
 
 The runner saves individual logs and `results.csv` under `build/task05-results`.
 Use distinct `-OutputDirectory` paths to retain multiple runs. Default benchmark
 behavior still sorts all 100 million values and retains ten measurements.
+
+## Experiment 2: stable packed local counting
+
+After the global scan passed validation, `radix_sort_local_counting_packed` was
+added as a separate experiment. Six uint planes hold three 9-bit counters each
+(the last plane uses one). Counts never exceed 256, including the all-equal case;
+9 bits prevent carries between adjacent packed counters. An exclusive Blelloch
+scan produces each original element's rank within its own digit directly.
+Invalid tail lanes contribute zero and still execute every barrier.
+
+This replaces four bit partitions and their key/index permutations with one
+scan: 18 barriers instead of 76. Shared memory increases from 5248 to 6360 bytes.
+Input reads and rank writes remain contiguous. Padding reduces tree bank
+conflicts. The code keeps packed counters in shared memory and uses scalar
+temporaries rather than a private 16-counter histogram per thread. Actual V100
+register usage, spills and occupancy still need NVIDIA compilation/profiling;
+fewer barriers alone do not prove a V100 speedup. No subgroup extensions or
+implicit warp synchronization are required.
+
+All six required random-input sizes passed again, with ten measurements each:
+
+| n | Hierarchical scan + packed counting median, ms |
+|---:|---:|
+| 10 | 0.2885 |
+| 256 | 0.3200 |
+| 257 | 0.2710 |
+| 600 | 0.3353 |
+| 65537 | 1.4234 |
+| 100000000 | 1456.47 |
+
+On the same laptop, the 100-million full-range uint32 case passed at 1499.75 ms
+(baseline 2292.50, global scan alone 2415.03). The four edge patterns at all five
+smaller required sizes also passed. Direct tests verify **every rank**, not only
+sorted key values, at 1, 10, 255, 256, 257, 600 and 65537, with four distributions
+and eight digit shifts, against both the original kernel and CPU expectations.
+These checks include 256 identical digits to exercise the 9-bit counter limit.
+Both direct test suites also passed on the independent Intel CPU OpenCL runtime.
+Final smoke tests passed all four scan/counting combinations at 10, 257 and 600.
+
+Default configuration is hierarchical scan + packed counting. To reproduce the
+original algorithm set both `TASK05_SCAN=baseline` and `TASK05_LOCAL=baseline`.
+The PowerShell runner defaults to baseline counting to isolate the scan change;
+use `-LocalCounters baseline,packed` for the second experiment. It logs both
+algorithm selections and rejects missing validation or fewer measurements.

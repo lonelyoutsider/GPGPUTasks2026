@@ -53,6 +53,40 @@ void testHistogramScan()
         std::cout << "PASS histogram exclusive scan n=" << n << " patterns=3" << std::endl;
     }
 }
+
+void testLocalCounting()
+{
+    ocl::KernelSource baseline(ocl::getRadixSort01LocalCounting());
+    ocl::KernelSource packed(ocl::getRadixSort01LocalCounting(), "radix_sort_local_counting_packed");
+    FastRandom random;
+    for (unsigned int n : {1u, 10u, 255u, 256u, 257u, 600u, 65537u}) {
+        const unsigned int groups = (n + GROUP_SIZE - 1) / GROUP_SIZE;
+        gpu::gpu_mem_32u input(n), ranks(n), counts(16u * groups);
+        std::vector<unsigned int> values(n), expected_ranks(n);
+        for (unsigned int pattern = 0; pattern < 4; ++pattern) {
+            for (unsigned int i = 0; i < n; ++i) {
+                const auto value = (static_cast<unsigned int>(random.next()) << 1u) | random.next(0, 1);
+                values[i] = pattern == 0 ? value : pattern == 1 ? 0xffffffffu
+                    : pattern == 2 ? (value % 16u) * 0x11111111u : 0u;
+            }
+            input.writeN(values.data(), n);
+            for (unsigned int shift = 0; shift < 32; shift += 4) {
+                std::vector<unsigned int> expected_counts(16u * groups, 0u);
+                for (unsigned int i = 0; i < n; ++i) {
+                    const auto digit = (values[i] >> shift) & 15u;
+                    expected_ranks[i] = expected_counts[digit * groups + i / GROUP_SIZE]++;
+                }
+                for (auto* kernel : {&baseline, &packed}) {
+                    kernel->exec(gpu::WorkSize(GROUP_SIZE, n), input, ranks, counts, n, groups, shift);
+                    rassert(ranks.readVector() == expected_ranks, 6235171, n, pattern, shift);
+                    rassert(counts.readVector() == expected_counts, 6235172, n, pattern, shift);
+                }
+            }
+            rassert(input.readVector() == values, 6235173, n, pattern);
+        }
+        std::cout << "PASS stable local ranks/counts n=" << n << " patterns=4 shifts=8 variants=2" << std::endl;
+    }
+}
 }
 
 void run(int argc, char** argv)
@@ -73,6 +107,10 @@ void run(int argc, char** argv)
     gpu::Context context = activateContext(device, gpu::Context::TypeOpenCL);
     if (std::getenv("TASK05_SCAN_TEST")) {
         testHistogramScan();
+        return;
+    }
+    if (std::getenv("TASK05_LOCAL_TEST")) {
+        testLocalCounting();
         return;
     }
     // OpenCL - рекомендуется как вариант по умолчанию, можно выполнять на CPU, есть printf, есть аналог valgrind/cuda-memcheck - https://github.com/jrprice/Oclgrind
@@ -102,6 +140,12 @@ void run(int argc, char** argv)
     if (scan_mode != "baseline" && scan_mode != "hierarchical")
         throw std::runtime_error("TASK05_SCAN must be baseline or hierarchical");
     const bool baseline_scan = scan_mode == "baseline";
+    const char* local_env = std::getenv("TASK05_LOCAL");
+    const std::string local_mode = local_env ? local_env : "packed";
+    if (local_mode != "baseline" && local_mode != "packed")
+        throw std::runtime_error("TASK05_LOCAL must be baseline or packed");
+    ocl::KernelSource ocl_localPacked(ocl::getRadixSort01LocalCounting(), "radix_sort_local_counting_packed");
+    auto& local_counting = local_mode == "packed" ? ocl_localPacked : ocl_radixSort01LocalCounting;
     int max_value = std::numeric_limits<int>::max(); // TODO при отладке используйте минимальное max_value (например max_value=8) при котором воспроизводится бага
     const char* pattern_env = std::getenv("TASK05_PATTERN");
     const std::string pattern = pattern_env ? pattern_env : "random";
@@ -136,7 +180,8 @@ void run(int argc, char** argv)
             as[i] = 0xffffffffu - static_cast<unsigned int>(i);
     }
     std::cout << "n=" << n << " max_value=" << max_value
-              << " pattern=" << pattern << " scan=" << scan_mode << std::endl;
+              << " pattern=" << pattern << " scan=" << scan_mode
+              << " local=" << local_mode << std::endl;
 
     if (n > 1) {
         // убедимся что в массиве есть хотя бы несколько повторяющихся значений
@@ -223,7 +268,7 @@ void run(int argc, char** argv)
 
             for (unsigned int pass = 0u; pass < passes; ++pass) {
                 const unsigned int shift = 4u * pass;
-                ocl_radixSort01LocalCounting.exec(
+                local_counting.exec(
                     gpu::WorkSize(GROUP_SIZE, n),
                     *current_input, local_one_rank_gpu, block_one_counts_gpu,
                     static_cast<unsigned int>(n), num_groups, shift);
