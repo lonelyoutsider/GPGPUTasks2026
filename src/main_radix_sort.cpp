@@ -12,6 +12,20 @@
 #include "debug.h" // TODO очень советую использовать debug::prettyBits(...) для отладки
 
 #include <fstream>
+#include <cstdlib>
+
+namespace {
+int problemSize()
+{
+    const char* value = std::getenv("TASK05_SIZE");
+    if (!value) return 100000000;
+    size_t end = 0;
+    const auto n = std::stoull(value, &end);
+    if (value[end] != '\0' || n == 0 || n > 100000000)
+        throw std::runtime_error("TASK05_SIZE must be in [1, 100000000]");
+    return static_cast<int>(n);
+}
+}
 
 void run(int argc, char** argv)
 {
@@ -50,8 +64,13 @@ void run(int argc, char** argv)
 
     FastRandom r;
 
-    int n = 100*1000*1000; // // TODO при отладке используйте минимальное n (например n=5 или n=10) при котором воспроизводится бага
+    const int n = problemSize();
     int max_value = std::numeric_limits<int>::max(); // TODO при отладке используйте минимальное max_value (например max_value=8) при котором воспроизводится бага
+    const char* pattern_env = std::getenv("TASK05_PATTERN");
+    const std::string pattern = pattern_env ? pattern_env : "random";
+    if (pattern != "random" && pattern != "full-u32" &&
+        pattern != "duplicates" && pattern != "equal" && pattern != "descending")
+        throw std::runtime_error("Unknown TASK05_PATTERN");
 
     unsigned int bit_count = 0;
 
@@ -64,15 +83,25 @@ void run(int argc, char** argv)
     if (bit_count == 0) {
         bit_count = 1;
     }
+    if (pattern != "random") bit_count = 32;
 
     std::vector<unsigned int> as(n, 0);
     std::vector<unsigned int> sorted(n, 0);
     for (size_t i = 0; i < n; ++i) {
         as[i] = r.next(0, max_value);
+        if (pattern == "full-u32")
+            as[i] = (as[i] << 1u) | static_cast<unsigned int>(r.next(0, 1));
+        else if (pattern == "duplicates")
+            as[i] = (as[i] % 16u) * 0x11111111u;
+        else if (pattern == "equal")
+            as[i] = 0xffffffffu;
+        else if (pattern == "descending")
+            as[i] = 0xffffffffu - static_cast<unsigned int>(i);
     }
-    std::cout << "n=" << n << " max_value=" << max_value << std::endl;
+    std::cout << "n=" << n << " max_value=" << max_value
+              << " pattern=" << pattern << std::endl;
 
-    {
+    if (n > 1) {
         // убедимся что в массиве есть хотя бы несколько повторяющихся значений
         size_t force_duplicates_attempts = 3;
         bool all_attempts_missed = true;
@@ -85,6 +114,14 @@ void run(int argc, char** argv)
             }
         }
         rassert(!all_attempts_missed, 4353245123412);
+        // Guarantee duplicates independently of random index selection.
+        as[n - 1] = as[0];
+    }
+    if (pattern == "full-u32" && n >= 4) {
+        as[0] = 0u;
+        as[1] = 0x80000000u;
+        as[2] = 0xffffffffu;
+        as[n - 1] = 0xffffffffu;
     }
 
     {
@@ -210,6 +247,7 @@ void run(int argc, char** argv)
         times.push_back(t.elapsed());
     }
     std::cout << "GPU radix-sort times (in seconds) - " << stats::valuesStatsLine(times) << std::endl;
+    std::cout << "median_ms=" << stats::median(times) * 1000.0 << " measurements=" << times.size() << std::endl;
 
     // Вычисляем достигнутую эффективную пропускную способность видеопамяти (из соображений что мы отработали в один проход - считали массив и сохранили его переупорядоченным)
     double memory_size_gb = sizeof(unsigned int) * 2 * n / 1024.0 / 1024.0 / 1024.0;
@@ -228,6 +266,7 @@ void run(int argc, char** argv)
     for (size_t i = 0; i < n; ++i) {
         rassert(input_values[i] == as[i], 6573452432, input_values[i], as[i]);
     }
+    std::cout << "PASS: std::sort and unchanged input_gpu, n=" << n << std::endl;
 }
 
 int main(int argc, char** argv)
