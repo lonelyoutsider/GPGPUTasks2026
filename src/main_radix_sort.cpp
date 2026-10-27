@@ -8,6 +8,7 @@
 
 #include "kernels/defines.h"
 #include "kernels/kernels.h"
+#include "radix_scan.h"
 
 #include "debug.h" // TODO очень советую использовать debug::prettyBits(...) для отладки
 
@@ -24,6 +25,33 @@ int problemSize()
     if (value[end] != '\0' || n == 0 || n > 100000000)
         throw std::runtime_error("TASK05_SIZE must be in [1, 100000000]");
     return static_cast<int>(n);
+}
+
+void testHistogramScan()
+{
+    FastRandom random;
+    for (unsigned int n : {1u, 10u, 16u, 255u, 256u, 257u, 1023u, 1024u,
+            1025u, 6104u, 1048575u, 1048576u, 1048577u, 6250000u}) {
+        RadixHistogramScan scan(n);
+        gpu::gpu_mem_32u input(n), output(n);
+        std::vector<unsigned int> values(n);
+        for (unsigned int pattern = 0; pattern < 3; ++pattern) {
+            for (unsigned int i = 0; i < n; ++i)
+                values[i] = pattern == 0 ? random.next(0, 256)
+                    : pattern == 1 ? 1u : (i % 7u == 0 ? 256u : 0u);
+            input.writeN(values.data(), n);
+            // Reuse buffers with different data to expose stale prefix values.
+            scan.exec(input, output);
+            const auto actual = output.readVector();
+            unsigned int sum = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                rassert(actual[i] == sum, 6235161, n, pattern, i, actual[i], sum);
+                sum += values[i];
+            }
+            rassert(input.readVector() == values, 6235162, n, pattern);
+        }
+        std::cout << "PASS histogram exclusive scan n=" << n << " patterns=3" << std::endl;
+    }
 }
 }
 
@@ -43,6 +71,10 @@ void run(int argc, char** argv)
     // TODO 010 P.S. так же в случае CUDA - добавьте в CMake options (НЕ меняйте сами CMakeLists.txt чтобы не менять окружение тестирования):
     // TODO 010 "-DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CUDA_FLAGS=-lineinfo" (первое - чтобы включить поддержку WMMA, второе - чтобы compute-sanitizer и профилировщик знали номера строк кернела)
     gpu::Context context = activateContext(device, gpu::Context::TypeOpenCL);
+    if (std::getenv("TASK05_SCAN_TEST")) {
+        testHistogramScan();
+        return;
+    }
     // OpenCL - рекомендуется как вариант по умолчанию, можно выполнять на CPU, есть printf, есть аналог valgrind/cuda-memcheck - https://github.com/jrprice/Oclgrind
     // CUDA   - рекомендуется если у вас NVIDIA видеокарта, есть printf, т.к. в таком случае вы сможете пользоваться профилировщиком (nsight-compute) и санитайзером (compute-sanitizer, это бывший cuda-memcheck)
     // Vulkan - не рекомендуется, т.к. писать код (compute shaders) на шейдерном языке GLSL на мой взгляд менее приятно чем в случае OpenCL/CUDA
@@ -65,6 +97,11 @@ void run(int argc, char** argv)
     FastRandom r;
 
     const int n = problemSize();
+    const char* scan_env = std::getenv("TASK05_SCAN");
+    const std::string scan_mode = scan_env ? scan_env : "hierarchical";
+    if (scan_mode != "baseline" && scan_mode != "hierarchical")
+        throw std::runtime_error("TASK05_SCAN must be baseline or hierarchical");
+    const bool baseline_scan = scan_mode == "baseline";
     int max_value = std::numeric_limits<int>::max(); // TODO при отладке используйте минимальное max_value (например max_value=8) при котором воспроизводится бага
     const char* pattern_env = std::getenv("TASK05_PATTERN");
     const std::string pattern = pattern_env ? pattern_env : "random";
@@ -99,7 +136,7 @@ void run(int argc, char** argv)
             as[i] = 0xffffffffu - static_cast<unsigned int>(i);
     }
     std::cout << "n=" << n << " max_value=" << max_value
-              << " pattern=" << pattern << std::endl;
+              << " pattern=" << pattern << " scan=" << scan_mode << std::endl;
 
     if (n > 1) {
         // убедимся что в массиве есть хотя бы несколько повторяющихся значений
@@ -151,10 +188,13 @@ void run(int argc, char** argv)
     gpu::gpu_mem_32u global_one_prefix_gpu(hist_size);
 
     std::vector<gpu::gpu_mem_32u> levels;
+    RadixHistogramScan histogram_scan(hist_size);
     
-    for (unsigned int current_n = hist_size; current_n > 1;) {
-        current_n = (current_n + 1) / 2;
-        levels.emplace_back(current_n);
+    if (baseline_scan) {
+        for (unsigned int current_n = hist_size; current_n > 1;) {
+            current_n = (current_n + 1) / 2;
+            levels.emplace_back(current_n);
+        }
     }
 
     // Прогружаем входные данные по PCI-E шине: CPU RAM -> GPU VRAM
@@ -188,28 +228,35 @@ void run(int argc, char** argv)
                     *current_input, local_one_rank_gpu, block_one_counts_gpu,
                     static_cast<unsigned int>(n), num_groups, shift);
 
-                unsigned int current_n = hist_size;
-                for (size_t level = 0; level < levels.size(); ++level) {
-                    const unsigned int next_n = (current_n + 1u) / 2u;
-                    const gpu::gpu_mem_32u& src = level == 0u
-                        ? block_one_counts_gpu : levels[level - 1u];
-                    ocl_radixSort02GlobalPrefixesScanSumReduction.exec(
-                        gpu::WorkSize(GROUP_SIZE, next_n),
-                        src, levels[level], current_n);
-                    current_n = next_n;
-                }
+                if (baseline_scan) {
+                    unsigned int current_n = hist_size;
+                    for (size_t level = 0; level < levels.size(); ++level) {
+                        const unsigned int next_n = (current_n + 1u) / 2u;
+                        const gpu::gpu_mem_32u& src = level == 0u
+                            ? block_one_counts_gpu : levels[level - 1u];
+                        ocl_radixSort02GlobalPrefixesScanSumReduction.exec(
+                            gpu::WorkSize(GROUP_SIZE, next_n),
+                            src, levels[level], current_n);
+                        current_n = next_n;
+                    }
 
-                ocl_fillBufferWithZeros.exec(
-                    gpu::WorkSize(GROUP_SIZE, hist_size),
-                    global_one_prefix_gpu, hist_size);
-                ocl_radixSort03GlobalPrefixesScanAccumulation.exec(
-                    gpu::WorkSize(GROUP_SIZE, hist_size),
-                    block_one_counts_gpu, global_one_prefix_gpu, hist_size, 0u);
-                for (size_t level = 0; level < levels.size(); ++level) {
+                    ocl_fillBufferWithZeros.exec(
+                        gpu::WorkSize(GROUP_SIZE, hist_size),
+                        global_one_prefix_gpu, hist_size);
                     ocl_radixSort03GlobalPrefixesScanAccumulation.exec(
                         gpu::WorkSize(GROUP_SIZE, hist_size),
-                        levels[level], global_one_prefix_gpu, hist_size,
-                        static_cast<unsigned int>(level + 1u));
+                        block_one_counts_gpu, global_one_prefix_gpu, hist_size, 0u);
+                    for (size_t level = 0; level < levels.size(); ++level) {
+                        ocl_radixSort03GlobalPrefixesScanAccumulation.exec(
+                            gpu::WorkSize(GROUP_SIZE, hist_size),
+                            levels[level], global_one_prefix_gpu, hist_size,
+                            static_cast<unsigned int>(level + 1u));
+                    }
+                } else {
+                    // Three local scans + two offset additions for 6,250,000
+                    // counts. Reuse block sums as their own scanned prefixes.
+                    // The queue is in order; scatter below waits for completion.
+                    histogram_scan.exec(block_one_counts_gpu, global_one_prefix_gpu);
                 }
 
                 ocl_radixSort04Scatter.exec(
